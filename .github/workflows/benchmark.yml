@@ -1,0 +1,177 @@
+name: Benchmark
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      base:
+        description: 'Base ref to compare against (SHA or tag). Optional; provide at least one of base or head.'
+        required: false
+      head:
+        description: 'Head ref to benchmark (SHA or tag). Optional; provide at least one of base or head.'
+        required: false
+
+# Serialize benchmark runs: every run pushes to master, so concurrent runs
+# must not race each other's git pull --rebase and push. The default
+# cancel-in-progress: false queues the new run instead of cancelling the one
+# in progress.
+concurrency:
+  group: benchmark
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        # During a release event, GitHub Actions check out the release tag,
+        # which leads to a "detached HEAD" state. To commit and push the
+        # benchmark report back to the repository, we must explicitly check
+        # out the persistent target branch.
+        uses: actions/checkout@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: master
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Install benchstat
+        run: |
+          go install golang.org/x/perf/cmd/benchstat@v0.0.0-20260825160852-19be9d8e6c70
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+      - name: Resolve comparison refs
+        id: refs
+        env:
+          HEAD_INPUT: ${{ inputs.head }}
+          BASE_INPUT: ${{ inputs.base }}
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            # On a release, compare the new tag against the nearest previous
+            # release tag reachable from its parent commit.
+            HEAD_REF="${{ github.ref_name }}"
+            BASE_REF="$(git describe --tags --match 'v*' --abbrev=0 "${HEAD_REF}^")"
+            MODE="compare"
+          else
+            if [ -z "$BASE_INPUT" ] && [ -z "$HEAD_INPUT" ]; then
+              MODE=""
+            elif [ -z "$BASE_INPUT" ] || [ -z "$HEAD_INPUT" ]; then
+              MODE="single"
+              HEAD_REF="${HEAD_INPUT:-$BASE_INPUT}"
+              BASE_REF=""
+            else
+              MODE="compare"
+              HEAD_REF="$HEAD_INPUT"
+              BASE_REF="$BASE_INPUT"
+            fi
+          fi
+          echo "base=${BASE_REF}" >> "$GITHUB_OUTPUT"
+          echo "head=${HEAD_REF}" >> "$GITHUB_OUTPUT"
+          echo "mode=${MODE}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate inputs
+        env:
+          MODE: ${{ steps.refs.outputs.mode }}
+          BASE: ${{ steps.refs.outputs.base }}
+        run: |
+          if [ -z "$MODE" ]; then
+            echo "Error: provide at least one of 'base' or 'head'."
+            exit 1
+          fi
+          if [ "$MODE" = "compare" ] && [ -z "$BASE" ]; then
+            echo "Error: no previous release tag to compare against."
+            exit 1
+          fi
+
+      - name: Checkout base
+        if: steps.refs.outputs.mode == 'compare'
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.refs.outputs.base }}
+          path: base
+          fetch-depth: 1
+
+      - name: Checkout head
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.refs.outputs.head }}
+          path: head
+          fetch-depth: 1
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+
+      - name: Run benchmarks on base
+        if: steps.refs.outputs.mode == 'compare'
+        run: |
+          cd base
+          echo "Starting benchmark run for base..."
+          timeout 20m go test -bench=. -run=^$ -benchmem -count=4 -v ./... > ../base.txt || {
+            EXIT_CODE=$?
+            echo "Benchmark failed with exit code: $EXIT_CODE"
+            echo "Last 50 lines of output:"
+            tail -50 ../base.txt
+            exit $EXIT_CODE
+          }
+          if [ ! -s ../base.txt ]; then
+            echo "No benchmark results generated for base."
+            exit 1
+          fi
+
+      - name: Run benchmarks on head
+        run: |
+          cd head
+          echo "Starting benchmark run for head..."
+          timeout 20m go test -bench=. -run=^$ -benchmem -count=4 -v ./... > ../head.txt || {
+            EXIT_CODE=$?
+            echo "Benchmark failed with exit code: $EXIT_CODE"
+            echo "Last 50 lines of output:"
+            tail -50 ../head.txt
+            exit $EXIT_CODE
+          }
+          if [ ! -s ../head.txt ]; then
+            echo "No benchmark results generated for head."
+            exit 1
+          fi
+
+      - name: Generate benchmark report
+        env:
+          MODE: ${{ steps.refs.outputs.mode }}
+          BASE_REF: ${{ steps.refs.outputs.base }}
+          HEAD_REF: ${{ steps.refs.outputs.head }}
+        run: |
+          if [ "$MODE" = "compare" ]; then
+            # benchstat compares overlapping benchmark names only; benchmarks
+            # present in one run but not the other (added, removed, or renamed)
+            # are listed without a delta.
+            benchstat base.txt head.txt > benchstat.txt
+            TITLE="Benchmark comparison: ${BASE_REF} vs ${HEAD_REF}"
+          else
+            benchstat head.txt > benchstat.txt
+            TITLE="Benchmark report: ${HEAD_REF}"
+          fi
+          HEAD_SHA=$(git -C head rev-parse --short HEAD)
+          if [ "$MODE" = "compare" ]; then
+            BASE_SHA=$(git -C base rev-parse --short HEAD)
+          else
+            BASE_SHA="-"
+          fi
+          {
+            echo "# ${TITLE}"
+            echo ""
+            echo "- Date: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+            echo "- Base: ${BASE_REF} (${BASE_SHA})"
+            echo "- Head: ${HEAD_REF} (${HEAD_SHA})"
+            echo "- Go: $(go version)"
+            echo "- CPU: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs)"
+            echo ""
+            echo '```'
+            cat benchstat.txt
+            echo '```'
+          } > benchmark-report.md
+          cat benchmark-report.md >> "$GITHUB_STEP_SUMMARY"
